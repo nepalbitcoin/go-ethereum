@@ -1,358 +1,189 @@
-/*
-  This file is part of go-ethereum
+// Copyright 2015 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
-  go-ethereum is free software: you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 3 of the License, or
-  (at your option) any later version.
-
-  go-ethereum is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with go-ethereum.  If not, see <http://www.gnu.org/licenses/>.
-*/
 package rpc
 
 import (
-	"encoding/binary"
-	"encoding/json"
 	"fmt"
+	"math"
 	"math/big"
+	"reflect"
 	"strings"
+	"sync"
 
-	"errors"
-	"net"
-	"net/http"
-	"time"
-
-	"io"
-
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
+	"gopkg.in/fatih/set.v0"
 )
 
-type hexdata struct {
-	data  []byte
-	isNil bool
+// API describes the set of methods offered over the RPC interface
+type API struct {
+	Namespace string      // namespace under which the rpc methods of Service are exposed
+	Version   string      // api version for DApp's
+	Service   interface{} // receiver instance which holds the methods
+	Public    bool        // indication if the methods must be considered safe for public use
 }
 
-func (d *hexdata) String() string {
-	return "0x" + common.Bytes2Hex(d.data)
+// callback is a method callback which was registered in the server
+type callback struct {
+	rcvr        reflect.Value  // receiver of method
+	method      reflect.Method // callback
+	argTypes    []reflect.Type // input argument types
+	hasCtx      bool           // method's first argument is a context (not included in argTypes)
+	errPos      int            // err return idx, of -1 when method cannot return error
+	isSubscribe bool           // indication if the callback is a subscription
 }
 
-func (d *hexdata) MarshalJSON() ([]byte, error) {
-	if d.isNil {
-		return json.Marshal(nil)
-	}
-	return json.Marshal(d.String())
+// service represents a registered object
+type service struct {
+	name          string        // name for service
+	rcvr          reflect.Value // receiver of methods for the service
+	typ           reflect.Type  // receiver type
+	callbacks     callbacks     // registered handlers
+	subscriptions subscriptions // available subscriptions/notifications
 }
 
-func newHexData(input interface{}) *hexdata {
-	d := new(hexdata)
-
-	if input == nil {
-		d.isNil = true
-		return d
-	}
-	switch input := input.(type) {
-	case []byte:
-		d.data = input
-	case common.Hash:
-		d.data = input.Bytes()
-	case *common.Hash:
-		if input == nil {
-			d.isNil = true
-		} else {
-			d.data = input.Bytes()
-		}
-	case common.Address:
-		d.data = input.Bytes()
-	case *common.Address:
-		if input == nil {
-			d.isNil = true
-		} else {
-			d.data = input.Bytes()
-		}
-	case types.Bloom:
-		d.data = input.Bytes()
-	case *types.Bloom:
-		if input == nil {
-			d.isNil = true
-		} else {
-			d.data = input.Bytes()
-		}
-	case *big.Int:
-		if input == nil {
-			d.isNil = true
-		} else {
-			d.data = input.Bytes()
-		}
-	case int64:
-		d.data = big.NewInt(input).Bytes()
-	case uint64:
-		buff := make([]byte, 8)
-		binary.BigEndian.PutUint64(buff, input)
-		d.data = buff
-	case int:
-		d.data = big.NewInt(int64(input)).Bytes()
-	case uint:
-		d.data = big.NewInt(int64(input)).Bytes()
-	case int8:
-		d.data = big.NewInt(int64(input)).Bytes()
-	case uint8:
-		d.data = big.NewInt(int64(input)).Bytes()
-	case int16:
-		d.data = big.NewInt(int64(input)).Bytes()
-	case uint16:
-		buff := make([]byte, 2)
-		binary.BigEndian.PutUint16(buff, input)
-		d.data = buff
-	case int32:
-		d.data = big.NewInt(int64(input)).Bytes()
-	case uint32:
-		buff := make([]byte, 4)
-		binary.BigEndian.PutUint32(buff, input)
-		d.data = buff
-	case string: // hexstring
-		d.data = common.Big(input).Bytes()
-	default:
-		d.isNil = true
-	}
-
-	return d
+// serverRequest is an incoming request
+type serverRequest struct {
+	id            interface{}
+	svcname       string
+	rcvr          reflect.Value
+	callb         *callback
+	args          []reflect.Value
+	isUnsubscribe bool
+	err           Error
 }
 
-type hexnum struct {
-	data  []byte
-	isNil bool
+type serviceRegistry map[string]*service       // collection of services
+type callbacks map[string]*callback            // collection of RPC callbacks
+type subscriptions map[string]*callback        // collection of subscription callbacks
+type subscriptionRegistry map[string]*callback // collection of subscription callbacks
+
+// Server represents a RPC server
+type Server struct {
+	services       serviceRegistry
+	muSubcriptions sync.Mutex // protects subscriptions
+	subscriptions  subscriptionRegistry
+
+	run      int32
+	codecsMu sync.Mutex
+	codecs   *set.Set
 }
 
-func (d *hexnum) String() string {
-	// Get hex string from bytes
-	out := common.Bytes2Hex(d.data)
-	// Trim leading 0s
-	out = strings.TrimLeft(out, "0")
-	// Output "0x0" when value is 0
-	if len(out) == 0 {
-		out = "0"
-	}
-	return "0x" + out
+// rpcRequest represents a raw incoming RPC request
+type rpcRequest struct {
+	service  string
+	method   string
+	id       interface{}
+	isPubSub bool
+	params   interface{}
+	err      Error // invalid batch element
 }
 
-func (d *hexnum) MarshalJSON() ([]byte, error) {
-	if d.isNil {
-		return json.Marshal(nil)
-	}
-	return json.Marshal(d.String())
+// Error wraps RPC errors, which contain an error code in addition to the message.
+type Error interface {
+	Error() string  // returns the message
+	ErrorCode() int // returns the code
 }
 
-func newHexNum(input interface{}) *hexnum {
-	d := new(hexnum)
-
-	d.data = newHexData(input).data
-
-	return d
+// ServerCodec implements reading, parsing and writing RPC messages for the server side of
+// a RPC session. Implementations must be go-routine safe since the codec can be called in
+// multiple go-routines concurrently.
+type ServerCodec interface {
+	// Read next request
+	ReadRequestHeaders() ([]rpcRequest, bool, Error)
+	// Parse request argument to the given types
+	ParseRequestArguments([]reflect.Type, interface{}) ([]reflect.Value, Error)
+	// Assemble success response, expects response id and payload
+	CreateResponse(interface{}, interface{}) interface{}
+	// Assemble error response, expects response id and error
+	CreateErrorResponse(interface{}, Error) interface{}
+	// Assemble error response with extra information about the error through info
+	CreateErrorResponseWithInfo(id interface{}, err Error, info interface{}) interface{}
+	// Create notification response
+	CreateNotification(string, interface{}) interface{}
+	// Write msg to client.
+	Write(interface{}) error
+	// Close underlying data stream
+	Close()
+	// Closed when underlying connection is closed
+	Closed() <-chan interface{}
 }
 
-type RpcConfig struct {
-	ListenAddress string
-	ListenPort    uint
-	CorsDomain    string
-}
+var (
+	pendingBlockNumber  = big.NewInt(-2)
+	latestBlockNumber   = big.NewInt(-1)
+	earliestBlockNumber = big.NewInt(0)
+	maxBlockNumber      = big.NewInt(math.MaxInt64)
+)
 
-type InvalidTypeError struct {
-	method string
-	msg    string
-}
+type BlockNumber int64
 
-func (e *InvalidTypeError) Error() string {
-	return fmt.Sprintf("invalid type on field %s: %s", e.method, e.msg)
-}
+const (
+	PendingBlockNumber = BlockNumber(-2)
+	LatestBlockNumber  = BlockNumber(-1)
+)
 
-func NewInvalidTypeError(method, msg string) *InvalidTypeError {
-	return &InvalidTypeError{
-		method: method,
-		msg:    msg,
-	}
-}
+// UnmarshalJSON parses the given JSON fragment into a BlockNumber. It supports:
+// - "latest", "earliest" or "pending" as string arguments
+// - the block number
+// Returned errors:
+// - an invalid block number error when the given argument isn't a known strings
+// - an out of range error when the given block number is either too little or too large
+func (bn *BlockNumber) UnmarshalJSON(data []byte) error {
+	input := strings.TrimSpace(string(data))
 
-type InsufficientParamsError struct {
-	have int
-	want int
-}
-
-func (e *InsufficientParamsError) Error() string {
-	return fmt.Sprintf("insufficient params, want %d have %d", e.want, e.have)
-}
-
-func NewInsufficientParamsError(have int, want int) *InsufficientParamsError {
-	return &InsufficientParamsError{
-		have: have,
-		want: want,
-	}
-}
-
-type NotImplementedError struct {
-	Method string
-}
-
-func (e *NotImplementedError) Error() string {
-	return fmt.Sprintf("%s method not implemented", e.Method)
-}
-
-func NewNotImplementedError(method string) *NotImplementedError {
-	return &NotImplementedError{
-		Method: method,
-	}
-}
-
-type DecodeParamError struct {
-	err string
-}
-
-func (e *DecodeParamError) Error() string {
-	return fmt.Sprintf("could not decode, %s", e.err)
-
-}
-
-func NewDecodeParamError(errstr string) error {
-	return &DecodeParamError{
-		err: errstr,
-	}
-}
-
-type ValidationError struct {
-	ParamName string
-	msg       string
-}
-
-func (e *ValidationError) Error() string {
-	return fmt.Sprintf("%s not valid, %s", e.ParamName, e.msg)
-}
-
-func NewValidationError(param string, msg string) error {
-	return &ValidationError{
-		ParamName: param,
-		msg:       msg,
-	}
-}
-
-type RpcRequest struct {
-	Id      interface{}     `json:"id"`
-	Jsonrpc string          `json:"jsonrpc"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params"`
-}
-
-type RpcSuccessResponse struct {
-	Id      interface{} `json:"id"`
-	Jsonrpc string      `json:"jsonrpc"`
-	Result  interface{} `json:"result"`
-}
-
-type RpcErrorResponse struct {
-	Id      interface{}     `json:"id"`
-	Jsonrpc string          `json:"jsonrpc"`
-	Error   *RpcErrorObject `json:"error"`
-}
-
-type RpcErrorObject struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-	// Data    interface{} `json:"data"`
-}
-
-type listenerHasStoppedError struct {
-	msg string
-}
-
-func (self listenerHasStoppedError) Error() string {
-	return self.msg
-}
-
-var listenerStoppedError = listenerHasStoppedError{"Listener stopped"}
-
-// When https://github.com/golang/go/issues/4674 is fixed this could be replaced
-type stoppableTCPListener struct {
-	*net.TCPListener
-	stop chan struct{} // closed when the listener must stop
-}
-
-// Wraps the default handler and checks if the RPC service was stopped. In that case it returns an
-// error indicating that the service was stopped. This will only happen for connections which are
-// kept open (HTTP keep-alive) when the RPC service was shutdown.
-func newStoppableHandler(h http.Handler, stop chan struct{}) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case <-stop:
-			w.Header().Set("Content-Type", "application/json")
-			jsonerr := &RpcErrorObject{-32603, "RPC service stopped"}
-			send(w, &RpcErrorResponse{Jsonrpc: jsonrpcver, Id: nil, Error: jsonerr})
-		default:
-			h.ServeHTTP(w, r)
-		}
-	})
-}
-
-// Stop the listener and all accepted and still active connections.
-func (self *stoppableTCPListener) Stop() {
-	close(self.stop)
-}
-
-func newStoppableTCPListener(addr string) (*stoppableTCPListener, error) {
-	wl, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, err
+	if len(input) >= 2 && input[0] == '"' && input[len(input)-1] == '"' {
+		input = input[1 : len(input)-1]
 	}
 
-	if tcpl, ok := wl.(*net.TCPListener); ok {
-		stop := make(chan struct{})
-		l := &stoppableTCPListener{tcpl, stop}
-		return l, nil
+	if len(input) == 0 {
+		*bn = BlockNumber(latestBlockNumber.Int64())
+		return nil
 	}
 
-	return nil, errors.New("Unable to create TCP listener for RPC service")
-}
+	in := new(big.Int)
+	_, ok := in.SetString(input, 0)
 
-func (self *stoppableTCPListener) Accept() (net.Conn, error) {
-	for {
-		self.SetDeadline(time.Now().Add(time.Duration(1 * time.Second)))
-		c, err := self.TCPListener.AcceptTCP()
-
-		select {
-		case <-self.stop:
-			if c != nil { // accept timeout
-				c.Close()
-			}
-			self.TCPListener.Close()
-			return nil, listenerStoppedError
-		default:
+	if !ok { // test if user supplied string tag
+		strBlockNumber := input
+		if strBlockNumber == "latest" {
+			*bn = BlockNumber(latestBlockNumber.Int64())
+			return nil
 		}
 
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() && netErr.Temporary() {
-				continue // regular timeout
-			}
+		if strBlockNumber == "earliest" {
+			*bn = BlockNumber(earliestBlockNumber.Int64())
+			return nil
 		}
 
-		return &closableConnection{c, self.stop}, err
+		if strBlockNumber == "pending" {
+			*bn = BlockNumber(pendingBlockNumber.Int64())
+			return nil
+		}
+
+		return fmt.Errorf(`invalid blocknumber %s`, data)
 	}
+
+	if in.Cmp(earliestBlockNumber) >= 0 && in.Cmp(maxBlockNumber) <= 0 {
+		*bn = BlockNumber(in.Int64())
+		return nil
+	}
+
+	return fmt.Errorf("blocknumber not in range [%d, %d]", earliestBlockNumber, maxBlockNumber)
 }
 
-type closableConnection struct {
-	*net.TCPConn
-	closed chan struct{}
-}
-
-func (self *closableConnection) Read(b []byte) (n int, err error) {
-	select {
-	case <-self.closed:
-		self.TCPConn.Close()
-		return 0, io.EOF
-	default:
-		return self.TCPConn.Read(b)
-	}
+func (bn BlockNumber) Int64() int64 {
+	return (int64)(bn)
 }

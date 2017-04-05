@@ -1,48 +1,125 @@
+// Copyright 2015 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
 package tests
 
 import (
+	"math/big"
+	"path/filepath"
 	"testing"
+
+	"github.com/ethereum/go-ethereum/params"
 )
 
 func TestTransactions(t *testing.T) {
-	notWorking := make(map[string]bool, 100)
-
-	// TODO: all these tests should work! remove them from the array when they work
-	snafus := []string{
-		"TransactionWithHihghNonce", // fails due to testing upper bound of 256 bit nonce
-		"TransactionWithSvalueHigh", // fails due to C++ wrong ECDSA r,s ranges. see https://github.com/ethereum/yellowpaper/pull/112
-		"TransactionWithSvalue0",    // Invalid, 0 < s according to YP eq 205. probably typo/copy-paste error
-	}
-
-	for _, name := range snafus {
-		notWorking[name] = true
-	}
-
-	var err error
-	err = RunTransactionTests("./files/TransactionTests/ttTransactionTest.json",
-		notWorking)
+	config := &params.ChainConfig{}
+	err := RunTransactionTests(config, filepath.Join(transactionTestDir, "ttTransactionTest.json"), TransSkipTests)
 	if err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestWrongRLPTransactions(t *testing.T) {
-	notWorking := make(map[string]bool, 100)
-	var err error
-	err = RunTransactionTests("./files/TransactionTests/ttWrongRLPTransaction.json",
-		notWorking)
+	config := &params.ChainConfig{}
+	err := RunTransactionTests(config, filepath.Join(transactionTestDir, "ttWrongRLPTransaction.json"), TransSkipTests)
 	if err != nil {
 		t.Fatal(err)
 	}
 }
 
-//Not working until it's fields are in HEX
-func Test10MBtx(t *testing.T) {
-	t.Skip("Skipped in lieu of HEX encoding fix in this file.")
-	notWorking := make(map[string]bool, 100)
-	var err error
-	err = RunTransactionTests("./files/TransactionTests/tt10mbDataField.json",
-		notWorking)
+func Test10MBTransactions(t *testing.T) {
+	config := &params.ChainConfig{}
+	err := RunTransactionTests(config, filepath.Join(transactionTestDir, "tt10mbDataField.json"), TransSkipTests)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// homestead tests
+func TestHomesteadTransactions(t *testing.T) {
+	config := &params.ChainConfig{
+		HomesteadBlock: big.NewInt(0),
+	}
+	err := RunTransactionTests(config, filepath.Join(transactionTestDir, "Homestead", "ttTransactionTest.json"), TransSkipTests)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHomesteadWrongRLPTransactions(t *testing.T) {
+	config := &params.ChainConfig{
+		HomesteadBlock: big.NewInt(0),
+	}
+	err := RunTransactionTests(config, filepath.Join(transactionTestDir, "Homestead", "ttWrongRLPTransaction.json"), TransSkipTests)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHomestead10MBTransactions(t *testing.T) {
+	config := &params.ChainConfig{
+		HomesteadBlock: big.NewInt(0),
+	}
+	err := RunTransactionTests(config, filepath.Join(transactionTestDir, "Homestead", "tt10mbDataField.json"), TransSkipTests)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHomesteadVitalik(t *testing.T) {
+	config := &params.ChainConfig{
+		HomesteadBlock: big.NewInt(0),
+	}
+	err := RunTransactionTests(config, filepath.Join(transactionTestDir, "Homestead", "ttTransactionTestEip155VitaliksTests.json"), TransSkipTests)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTxEIP155Transaction(t *testing.T) {
+	config := &params.ChainConfig{
+		ChainId:        big.NewInt(1),
+		HomesteadBlock: big.NewInt(0),
+		EIP155Block:    big.NewInt(0),
+	}
+	err := RunTransactionTests(config, filepath.Join(transactionTestDir, "EIP155", "ttTransactionTest.json"), TransSkipTests)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTxEIP155VitaliksTests(t *testing.T) {
+	config := &params.ChainConfig{
+		ChainId:        big.NewInt(1),
+		HomesteadBlock: big.NewInt(0),
+		EIP155Block:    big.NewInt(0),
+	}
+	err := RunTransactionTests(config, filepath.Join(transactionTestDir, "EIP155", "ttTransactionTestEip155VitaliksTests.json"), TransSkipTests)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTxEIP155VRule(t *testing.T) {
+	config := &params.ChainConfig{
+		ChainId:        big.NewInt(1),
+		HomesteadBlock: big.NewInt(0),
+		EIP155Block:    big.NewInt(0),
+	}
+	err := RunTransactionTests(config, filepath.Join(transactionTestDir, "EIP155", "ttTransactionTestVRule.json"), TransSkipTests)
 	if err != nil {
 		t.Fatal(err)
 	}

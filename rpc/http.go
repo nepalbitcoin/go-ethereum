@@ -1,144 +1,177 @@
+// Copyright 2015 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
 package rpc
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
+	"strings"
+	"sync"
+	"time"
 
-	"github.com/ethereum/go-ethereum/logger"
-	"github.com/ethereum/go-ethereum/logger/glog"
-	"github.com/ethereum/go-ethereum/xeth"
 	"github.com/rs/cors"
 )
 
-var rpclistener *stoppableTCPListener
-
 const (
-	jsonrpcver       = "2.0"
-	maxSizeReqLength = 1024 * 1024 // 1MB
+	maxHTTPRequestContentLength = 1024 * 128
 )
 
-func Start(pipe *xeth.XEth, config RpcConfig) error {
-	if rpclistener != nil {
-		if fmt.Sprintf("%s:%d", config.ListenAddress, config.ListenPort) != rpclistener.Addr().String() {
-			return fmt.Errorf("RPC service already running on %s ", rpclistener.Addr().String())
-		}
-		return nil // RPC service already running on given host/port
-	}
+var nullAddr, _ = net.ResolveTCPAddr("tcp", "127.0.0.1:0")
 
-	l, err := newStoppableTCPListener(fmt.Sprintf("%s:%d", config.ListenAddress, config.ListenPort))
+type httpConn struct {
+	client    *http.Client
+	req       *http.Request
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+// httpConn is treated specially by Client.
+func (hc *httpConn) LocalAddr() net.Addr              { return nullAddr }
+func (hc *httpConn) RemoteAddr() net.Addr             { return nullAddr }
+func (hc *httpConn) SetReadDeadline(time.Time) error  { return nil }
+func (hc *httpConn) SetWriteDeadline(time.Time) error { return nil }
+func (hc *httpConn) SetDeadline(time.Time) error      { return nil }
+func (hc *httpConn) Write([]byte) (int, error)        { panic("Write called") }
+
+func (hc *httpConn) Read(b []byte) (int, error) {
+	<-hc.closed
+	return 0, io.EOF
+}
+
+func (hc *httpConn) Close() error {
+	hc.closeOnce.Do(func() { close(hc.closed) })
+	return nil
+}
+
+// DialHTTP creates a new RPC clients that connection to an RPC server over HTTP.
+func DialHTTP(endpoint string) (*Client, error) {
+	req, err := http.NewRequest("POST", endpoint, nil)
 	if err != nil {
-		glog.V(logger.Error).Infof("Can't listen on %s:%d: %v", config.ListenAddress, config.ListenPort, err)
-		return err
+		return nil, err
 	}
-	rpclistener = l
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
 
-	var handler http.Handler
-	if len(config.CorsDomain) > 0 {
-		var opts cors.Options
-		opts.AllowedMethods = []string{"POST"}
-		opts.AllowedOrigins = []string{config.CorsDomain}
-
-		c := cors.New(opts)
-		handler = newStoppableHandler(c.Handler(JSONRPC(pipe)), l.stop)
-	} else {
-		handler = newStoppableHandler(JSONRPC(pipe), l.stop)
-	}
-
-	go http.Serve(l, handler)
-
-	return nil
-}
-
-func Stop() error {
-	if rpclistener != nil {
-		rpclistener.Stop()
-		rpclistener = nil
-	}
-
-	return nil
-}
-
-// JSONRPC returns a handler that implements the Ethereum JSON-RPC API.
-func JSONRPC(pipe *xeth.XEth) http.Handler {
-	api := NewEthereumApi(pipe)
-
-	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-
-		// Limit request size to resist DoS
-		if req.ContentLength > maxSizeReqLength {
-			jsonerr := &RpcErrorObject{-32700, "Request too large"}
-			send(w, &RpcErrorResponse{Jsonrpc: jsonrpcver, Id: nil, Error: jsonerr})
-			return
-		}
-
-		// Read request body
-		defer req.Body.Close()
-		body, err := ioutil.ReadAll(req.Body)
-		if err != nil {
-			jsonerr := &RpcErrorObject{-32700, "Could not read request body"}
-			send(w, &RpcErrorResponse{Jsonrpc: jsonrpcver, Id: nil, Error: jsonerr})
-		}
-
-		// Try to parse the request as a single
-		var reqSingle RpcRequest
-		if err := json.Unmarshal(body, &reqSingle); err == nil {
-			response := RpcResponse(api, &reqSingle)
-			send(w, &response)
-			return
-		}
-
-		// Try to parse the request to batch
-		var reqBatch []RpcRequest
-		if err := json.Unmarshal(body, &reqBatch); err == nil {
-			// Build response batch
-			resBatch := make([]*interface{}, len(reqBatch))
-			for i, request := range reqBatch {
-				response := RpcResponse(api, &request)
-				resBatch[i] = response
-			}
-			send(w, resBatch)
-			return
-		}
-
-		// Not a batch or single request, error
-		jsonerr := &RpcErrorObject{-32600, "Could not decode request"}
-		send(w, &RpcErrorResponse{Jsonrpc: jsonrpcver, Id: nil, Error: jsonerr})
+	initctx := context.Background()
+	return newClient(initctx, func(context.Context) (net.Conn, error) {
+		return &httpConn{client: new(http.Client), req: req, closed: make(chan struct{})}, nil
 	})
 }
 
-func RpcResponse(api *EthereumApi, request *RpcRequest) *interface{} {
-	var reply, response interface{}
-	reserr := api.GetRequestReply(request, &reply)
-	switch reserr.(type) {
-	case nil:
-		response = &RpcSuccessResponse{Jsonrpc: jsonrpcver, Id: request.Id, Result: reply}
-	case *NotImplementedError:
-		jsonerr := &RpcErrorObject{-32601, reserr.Error()}
-		response = &RpcErrorResponse{Jsonrpc: jsonrpcver, Id: request.Id, Error: jsonerr}
-	case *DecodeParamError, *InsufficientParamsError, *ValidationError, *InvalidTypeError:
-		jsonerr := &RpcErrorObject{-32602, reserr.Error()}
-		response = &RpcErrorResponse{Jsonrpc: jsonrpcver, Id: request.Id, Error: jsonerr}
-	default:
-		jsonerr := &RpcErrorObject{-32603, reserr.Error()}
-		response = &RpcErrorResponse{Jsonrpc: jsonrpcver, Id: request.Id, Error: jsonerr}
+func (c *Client) sendHTTP(ctx context.Context, op *requestOp, msg interface{}) error {
+	hc := c.writeConn.(*httpConn)
+	respBody, err := hc.doRequest(ctx, msg)
+	if err != nil {
+		return err
 	}
-
-	glog.V(logger.Detail).Infof("Generated response: %T %s", response, response)
-	return &response
+	defer respBody.Close()
+	var respmsg jsonrpcMessage
+	if err := json.NewDecoder(respBody).Decode(&respmsg); err != nil {
+		return err
+	}
+	op.resp <- &respmsg
+	return nil
 }
 
-func send(writer io.Writer, v interface{}) (n int, err error) {
-	var payload []byte
-	payload, err = json.MarshalIndent(v, "", "\t")
+func (c *Client) sendBatchHTTP(ctx context.Context, op *requestOp, msgs []*jsonrpcMessage) error {
+	hc := c.writeConn.(*httpConn)
+	respBody, err := hc.doRequest(ctx, msgs)
 	if err != nil {
-		glog.V(logger.Error).Infoln("Error marshalling JSON", err)
-		return 0, err
+		return err
 	}
-	glog.V(logger.Detail).Infof("Sending payload: %s", payload)
+	defer respBody.Close()
+	var respmsgs []jsonrpcMessage
+	if err := json.NewDecoder(respBody).Decode(&respmsgs); err != nil {
+		return err
+	}
+	for _, respmsg := range respmsgs {
+		op.resp <- &respmsg
+	}
+	return nil
+}
 
-	return writer.Write(payload)
+func (hc *httpConn) doRequest(ctx context.Context, msg interface{}) (io.ReadCloser, error) {
+	body, err := json.Marshal(msg)
+	if err != nil {
+		return nil, err
+	}
+	req := hc.req.WithContext(ctx)
+	req.Body = ioutil.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+
+	resp, err := hc.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Body, nil
+}
+
+// httpReadWriteNopCloser wraps a io.Reader and io.Writer with a NOP Close method.
+type httpReadWriteNopCloser struct {
+	io.Reader
+	io.Writer
+}
+
+// Close does nothing and returns always nil
+func (t *httpReadWriteNopCloser) Close() error {
+	return nil
+}
+
+// NewHTTPServer creates a new HTTP RPC server around an API provider.
+//
+// Deprecated: Server implements http.Handler
+func NewHTTPServer(corsString string, srv *Server) *http.Server {
+	return &http.Server{Handler: newCorsHandler(srv, corsString)}
+}
+
+// ServeHTTP serves JSON-RPC requests over HTTP.
+func (srv *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.ContentLength > maxHTTPRequestContentLength {
+		http.Error(w,
+			fmt.Sprintf("content length too large (%d>%d)", r.ContentLength, maxHTTPRequestContentLength),
+			http.StatusRequestEntityTooLarge)
+		return
+	}
+	w.Header().Set("content-type", "application/json")
+
+	// create a codec that reads direct from the request body until
+	// EOF and writes the response to w and order the server to process
+	// a single request.
+	codec := NewJSONCodec(&httpReadWriteNopCloser{r.Body, w})
+	defer codec.Close()
+	srv.ServeSingleRequest(codec, OptionMethodInvocation)
+}
+
+func newCorsHandler(srv *Server, corsString string) http.Handler {
+	var allowedOrigins []string
+	for _, domain := range strings.Split(corsString, ",") {
+		allowedOrigins = append(allowedOrigins, strings.TrimSpace(domain))
+	}
+	c := cors.New(cors.Options{
+		AllowedOrigins: allowedOrigins,
+		AllowedMethods: []string{"POST", "GET"},
+		MaxAge:         600,
+		AllowedHeaders: []string{"*"},
+	})
+	return c.Handler(srv)
 }
